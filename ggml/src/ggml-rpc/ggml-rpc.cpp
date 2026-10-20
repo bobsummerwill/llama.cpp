@@ -1052,12 +1052,12 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         const size_t min_size = ggml_nbytes(tensor);
 
         // Cache key for calls to read the alloc_size.
-        // We deliberately exclude src tensor dimensions from the key because:
-        // 1. For CPU backends, alloc_size = ggml_nbytes(output) regardless of src shapes
-        // 2. For GPU backends, the reservation graph uses max dimensions, so the
-        //    cached value from reservation is always >= any subsequent request
-        // 3. Including src dims causes cache misses per-ubatch (e.g. growing KV cache)
-        //    which blocks the main thread behind in-flight GRAPH_COMPUTE commands
+        // src tensor dimensions are not part of the key: a miss blocks the main thread behind in-flight
+        // GRAPH_COMPUTE commands, and it must not happen for every ubatch (e.g. decode after prefill).
+        // The remote size can still depend on the srcs (e.g. the Metal TOP_K and FLASH_ATTN_EXT scratch
+        // grows with the number of KV cells, which the reservation graph does not always cover), so each
+        // entry remembers the src shapes it was queried with and is only reused for srcs that fit within
+        // them. Reusing it for smaller srcs only over-allocates.
         struct alloc_size_cache_key {
             uint32_t device;
             uint32_t type;
@@ -1080,17 +1080,37 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         uint64_t cache_hash = fnv_hash((const uint8_t *)&key, sizeof(key));
         cache_hash = fnv_hash((const uint8_t *)buft_ctx->endpoint.data(), buft_ctx->endpoint.size(), cache_hash);
 
-        // alloc sizes are immutable for a given tensor configuration
+        struct alloc_size_cache_entry {
+            int64_t src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
+            size_t  alloc_size;
+
+            // true if every src of `t` fits within the srcs this entry was queried with
+            bool covers(const ggml_tensor * t) const {
+                for (int i = 0; i < GGML_MAX_SRC; i++) {
+                    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                        if ((t->src[i] ? t->src[i]->ne[d] : 0) > src_ne[i][d]) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+        };
+
         static std::mutex cache_mutex;
-        static std::unordered_map<uint64_t, size_t> cache;
+        static std::unordered_map<uint64_t, std::vector<alloc_size_cache_entry>> cache;
 
         {
             std::lock_guard<std::mutex> lock(cache_mutex);
             auto it = cache.find(cache_hash);
             if (it != cache.end()) {
-                LOG_DBG3("[%s] cache hit: %s -> %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
-                         rpc_log_format_size(it->second).c_str());
-                return std::max<size_t>(it->second, min_size);
+                for (const auto & entry : it->second) {
+                    if (entry.covers(tensor)) {
+                        LOG_DBG3("[%s] cache hit: %s -> %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
+                                 rpc_log_format_size(entry.alloc_size).c_str());
+                        return std::max<size_t>(entry.alloc_size, min_size);
+                    }
+                }
             }
         }
 
@@ -1109,8 +1129,34 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         dispatcher->send(RPC_CMD_GET_ALLOC_SIZE, request, sizeof(*request), &response, sizeof(response));
 
         {
+            alloc_size_cache_entry entry = {};
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                    entry.src_ne[i][d] = tensor->src[i] ? tensor->src[i]->ne[d] : 0;
+                }
+            }
+            entry.alloc_size = response.alloc_size;
+
             std::lock_guard<std::mutex> lock(cache_mutex);
-            cache[cache_hash] = response.alloc_size;
+            auto & entries = cache[cache_hash];
+            // drop the entries that the new one covers, they will not be hit anymore
+            std::vector<alloc_size_cache_entry> kept;
+            for (const auto & e : entries) {
+                bool covered = true;
+                for (int i = 0; i < GGML_MAX_SRC && covered; i++) {
+                    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                        if (e.src_ne[i][d] > entry.src_ne[i][d]) {
+                            covered = false;
+                            break;
+                        }
+                    }
+                }
+                if (!covered) {
+                    kept.push_back(e);
+                }
+            }
+            kept.push_back(entry);
+            entries = std::move(kept);
         }
 
         LOG_DBG2("[%s] %s -> alloc_size: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
